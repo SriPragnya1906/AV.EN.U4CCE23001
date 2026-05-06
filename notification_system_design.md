@@ -1,46 +1,254 @@
-# Stage 1: API Design & Planning
+# Stage 1
 
-So, I'm thinking about how students should get their notifications once they log in. The system needs to be simple but reliable. I've mapped out a few core actions: listing all notifications, grabbing a single one to read the full message, and marking them as read so they don't clutter the inbox.
+## REST API Design & Contract
 
-For the endpoints, I'll go with something like:
-- `GET /notifications` - This is the main one. It'll support pagination (using `page` and `limit`) and filtering by type (like `Placement` or `Result`).
-- `GET /notifications/:id` - To see the specific details.
-- `PATCH /notifications/:id/read` - Just to flip that `isRead` flag.
+### Core Actions
+1. Fetch notifications (with pagination and filtering)
+2. Get details of a single notification
+3. Mark a specific notification as read
+4. Mark all notifications as read
+5. Real-time updates for new notifications
 
-As for real-time updates, I was considering WebSockets, but honestly, for a notification system where the data mostly flows one way (server to student), **SSE (Server-Sent Events)** feels like a better fit. It's lighter than WebSockets, handles reconnections natively, and is way easier to implement over standard HTTP.
+### Base URL
+`/api/v1`
 
-# Stage 2: Figuring Out the Storage
+### Endpoints
 
-For persistent storage, I'm leaning towards **PostgreSQL**. Since our data is fairly structured (students have notifications, types are limited), a relational DB makes a lot of sense. Plus, I want to make sure that when a student marks a notification as read, it actually stays read (ACD properties!).
+#### 1. Fetch Notifications
+- **Method:** GET
+- **Endpoint:** `/notifications`
+- **Headers:**
+  - `Authorization: Bearer <token>`
+- **Query Parameters:**
+  - `page` (optional, default 1)
+  - `limit` (optional, default 10)
+  - `type` (optional, enum: Event, Result, Placement)
+- **Response (200 OK):**
+```json
+{
+  "notifications": [
+    {
+      "id": "uuid",
+      "type": "Placement",
+      "message": "Placement drive tomorrow",
+      "isRead": false,
+      "createdAt": "2026-05-06T10:00:00Z"
+    }
+  ],
+  "meta": {
+    "currentPage": 1,
+    "totalPages": 5,
+    "totalCount": 50
+  }
+}
+```
 
-Here's a rough schema I have in mind:
-- A `students` table for names and emails.
-- A `notifications` table with columns like `id`, `student_id`, `type`, `message`, `is_read`, and `created_at`.
+#### 2. Get Single Notification
+- **Method:** GET
+- **Endpoint:** `/notifications/{id}`
+- **Headers:**
+  - `Authorization: Bearer <token>`
+- **Response (200 OK):**
+```json
+{
+  "id": "uuid",
+  "type": "Placement",
+  "message": "Placement drive tomorrow",
+  "isRead": false,
+  "createdAt": "2026-05-06T10:00:00Z"
+}
+```
 
-As we get more students—like 50,000+—I know things might slow down. I'll definitely need to index the `student_id` and `is_read` columns. If it gets really massive, I'd look into table partitioning by date, maybe keeping only the last 6 months in the active table.
+#### 3. Mark Notification as Read
+- **Method:** PATCH
+- **Endpoint:** `/notifications/{id}/read`
+- **Headers:**
+  - `Authorization: Bearer <token>`
+- **Response (200 OK):**
+```json
+{
+  "success": true,
+  "id": "uuid",
+  "isRead": true
+}
+```
 
-# Stage 3: Fixing the Slow Query
+#### 4. Mark All as Read
+- **Method:** PATCH
+- **Endpoint:** `/notifications/read-all`
+- **Headers:**
+  - `Authorization: Bearer <token>`
+- **Response (200 OK):**
+```json
+{
+  "success": true,
+  "updatedCount": 5
+}
+```
 
-I saw this query earlier:
-`SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt ASC;`
+### Real-Time Mechanism
 
-It's definitely performing slowly because, with 5 million notifications, the database is likely doing a full scan for that student ID and then sorting in memory. To fix this, I'd add a composite index on `(studentID, isRead, createdAt)`. Also, I'd change the order to `DESC` because students usually want to see their *newest* notifications first, not the oldest ones from 3 months ago!
+For real-time notifications, I recommend **Server-Sent Events (SSE)**.
+- **Why?** Notifications are a unidirectional flow (server to client). WebSockets are bidirectional and add unnecessary overhead for this use case. SSE is natively supported by browsers via the `EventSource` API, works well over standard HTTP/HTTPS, and automatically handles reconnections.
 
-Also, a teammate suggested indexing every single column "to be safe." I don't think that's a good idea. Every index we add makes `INSERT` and `UPDATE` operations slower because the DB has to update all those index trees. It's a waste of space and performance.
+# Stage 2
 
-# Stage 4: Boosting Performance
+### Persistent Storage Choice
 
-To take the load off the main DB, I'd suggest two things:
-1. **Redis Caching:** We can cache the unread count or the first few notifications for each student in Redis. It's way faster than hitting the disk every page load.
-2. **Pagination:** We shouldn't ever send all 500 notifications at once. Fetching 10-20 at a time is plenty.
+I suggest using a **Relational Database** like **PostgreSQL**.
+- **Reasoning:** The data is structured. Notifications belong to students, and there are clear relationships. We need ACID compliance to ensure data integrity (e.g., when marking notifications as read). PostgreSQL also supports JSONB if we ever need unstructured metadata, providing flexibility.
 
-# Stage 5: Scaling the Bulk Notifications
+### DB Schema (SQL)
 
-The original `notify_all` function is a bit of a nightmare for 50,000 students. Running a synchronous loop that calls an external Email API inside a DB transaction is asking for a timeout or a crash. If it fails halfway, we have no idea who got the email and who didn't.
+```sql
+CREATE TYPE notification_type AS ENUM ('Event', 'Result', 'Placement');
 
-My redesign would use a **Message Queue** (like RabbitMQ or even a simple Redis queue).
-1. The main function just saves the notification to the DB and pushes the IDs into the queue.
-2. Background workers pick up the jobs and handle the email sending. 
-3. This way, if an email fails, we can just retry that specific job without affecting everyone else. 
+CREATE TABLE students (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL
+);
 
-Decoupling the DB save from the email send is crucial because the DB is fast and reliable, while external APIs are slow and can fail. We don't want a slow API to hang our database.
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id INT REFERENCES students(id) ON DELETE CASCADE,
+    type notification_type NOT NULL,
+    message TEXT NOT NULL,
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Scalability Problems & Solutions
+- **Problem:** As data volume grows (millions of notifications), basic queries will slow down due to sequential scanning.
+- **Solution:** Add indexes on heavily queried columns (e.g., `student_id`, `created_at`).
+- **Problem:** The table size becomes too large to fit in memory, slowing down inserts and updates.
+- **Solution:** Table partitioning by date (e.g., partitioning `notifications` by month/year) so old notifications can be archived or dropped efficiently.
+
+### Sample Queries
+
+```sql
+-- Fetch unread notifications for a student
+SELECT * FROM notifications 
+WHERE student_id = 101 AND is_read = FALSE 
+ORDER BY created_at DESC 
+LIMIT 10 OFFSET 0;
+
+-- Mark notification as read
+UPDATE notifications 
+SET is_read = TRUE 
+WHERE id = 'some-uuid' AND student_id = 101;
+```
+
+# Stage 3
+
+### Query Analysis
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+- **Is it accurate?** It's functionally accurate, but `ORDER BY createdAt ASC` shows the *oldest* unread notifications first, which is usually poor UX (users want the newest first).
+- **Why is it slow?** With 5 million rows, if there's no index covering `(studentID, isRead)`, the DB has to perform a full table scan or index scan on `studentID` and then filter for `isRead=false`, followed by a sort operation on `createdAt`.
+- **What to change:**
+  1. Change `ASC` to `DESC` to show newest first.
+  2. Create a composite index: `CREATE INDEX idx_student_unread_date ON notifications (studentID, isRead, createdAt DESC);`
+  3. Avoid `SELECT *`. Only select needed columns to reduce memory overhead.
+- **Indexing every column?** This is bad advice. Indexes speed up reads but slow down writes (INSERT/UPDATE/DELETE). They also consume disk space and RAM. Only index columns used frequently in WHERE clauses, JOINs, and ORDER BY.
+
+### Query: Placement notifications in the last 7 days
+
+```sql
+SELECT DISTINCT s.id, s.name, s.email
+FROM students s
+JOIN notifications n ON s.id = n.student_id
+WHERE n.type = 'Placement' 
+  AND n.created_at >= NOW() - INTERVAL '7 days';
+```
+
+# Stage 4
+
+### Performance Improvements for High Load
+
+Fetching notifications on every page load overwhelms the DB.
+
+#### 1. Caching Layer (Redis)
+Store the top N unread notifications for active students in Redis (e.g., a Redis List or Sorted Set).
+- **Pros:** Blazing fast reads. Reduces DB load significantly.
+- **Tradeoffs:** Adds complexity (cache invalidation). If a notification is marked read in DB, the cache must be updated simultaneously (cache staleness).
+
+#### 2. Pagination / Lazy Loading
+Don't load all notifications. Load the first 10, then use cursor-based pagination as the user scrolls.
+- **Pros:** Reduces data transfer and DB query time.
+- **Tradeoffs:** Requires slight changes to API contract to support cursors instead of offset pagination.
+
+#### 3. Connection Pooling (PgBouncer)
+If the DB is overwhelmed by connections, use a connection pooler.
+- **Pros:** Prevents DB from running out of connections and crashing.
+- **Tradeoffs:** Slight overhead per connection.
+
+#### 4. Client-side Caching
+Cache the notifications in the browser (e.g., `localStorage` or session storage) and only fetch delta updates.
+- **Pros:** Zero DB calls on page navigation.
+- **Tradeoffs:** User might see stale data if real-time mechanism fails.
+
+# Stage 5
+
+### Shortcomings of the Pseudocode
+
+```python
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message) # calls Email API
+        save_to_db(student_id, message) # DB insert
+        push_to_app(student_id, message) # SSE push
+```
+
+1. **Synchronous Loop:** Processing 50,000 users sequentially will take hours.
+2. **No Fault Tolerance:** If `send_email` fails at student 200, the loop might crash, leaving 49,800 students without notifications. There's no retry mechanism.
+3. **Tight Coupling:** DB inserts and emails are tied together. If the email API is down, we can't even save the notification to the DB.
+
+### Redesign Approach
+
+Use an asynchronous **Message Queue** (like RabbitMQ or Redis/Celery) with worker nodes.
+- Do not process saving to DB and sending email synchronously together. They have different failure rates and latency. Saving to DB is fast; email APIs are slow and prone to rate limits.
+- **Solution:** Enqueue a "send_notification" job for each student. Workers pick up jobs independently.
+
+### Revised Pseudocode
+
+```python
+function notify_all(student_ids: array, message: string):
+    # Fast, batched DB insert (fail fast if DB is down)
+    batch_save_to_db(student_ids, message)
+    
+    # Enqueue jobs to a message broker
+    for student_id in student_ids:
+        enqueue_job("email_queue", student_id, message)
+        enqueue_job("push_queue", student_id, message)
+
+# Worker function (running in background, multiple instances)
+function process_email_job(job):
+    try:
+        send_email(job.student_id, job.message)
+    except EmailAPIError:
+        if job.retry_count < 3:
+            requeue_job_with_delay(job)
+        else:
+            send_to_dead_letter_queue(job)
+```
+
+# Stage 6
+
+### Priority Inbox Approach
+
+To maintain the top 10 most important unread notifications efficiently:
+1. **Weighting:** Placement (3), Result (2), Event (1).
+2. **Recency:** Newer notifications should rank higher within the same weight class. I'll use timestamp parsing to generate a score.
+3. **Data Structure:** A **Min-Heap** (Priority Queue) of size 10 is the most efficient way.
+   - When a new notification arrives, if the heap has < 10 items, just insert it.
+   - If the heap has 10 items, compare the new notification with the root of the min-heap (the *least* important of the top 10). If it's more important, pop the root and insert the new one.
+   - Time Complexity: O(N log k) where N is total notifications and k is 10. Since k=10, it's effectively O(N) to process all, and O(log 10) = O(1) for each new incoming notification.
+
+(See `priority_inbox.js` for the implementation)
